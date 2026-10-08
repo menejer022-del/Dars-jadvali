@@ -6,6 +6,7 @@ import os
 import sys
 from collections import defaultdict
 from openpyxl import load_workbook, Workbook
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from ortools.sat.python import cp_model
 
@@ -76,10 +77,53 @@ def load_rows(ws):
 # ------------------------------------------------------------------ model
 
 
+def diagnose(data, events):
+    """Model qurishdan oldin ma'lumotdagi aniq muammolarni topadi (o'zbekcha xabarlar bilan)."""
+    days, pairs, groups, teachers, rooms, lessons = data
+    D, P = len(days), len(pairs)
+    issues = []
+
+    t_n = defaultdict(int)
+    g_n = defaultdict(int)
+    for e in events:
+        t_n[e["teacher"]] += 1
+        for g in e["groups"]:
+            g_n[g] += 1
+        tb = teachers[e["teacher"]][0]
+        ok = [1 for d in range(D) for p in range(P)
+              if (d, p) not in tb and all(d not in groups[g][1] for g in e["groups"])]
+        if not ok:
+            issues.append(f"Dars №{e['id']} ({e['subject']}, {e['teacher']}): o'qituvchi va guruhlarning "
+                          f"bo'sh vaqtlari umuman mos kelmaydi.")
+    for t, n in t_n.items():
+        busy, mx = teachers[t]
+        free = D * P - len(busy)
+        cap = min(free, mx * D)
+        if n > cap:
+            issues.append(f"O'qituvchi {t}: haftada {n} juftlik berilgan, lekin sig'adigan vaqt ko'pi bilan {cap} "
+                          f"(band vaqtlar va kuniga {mx} juftlik chegarasi hisobga olinganda).")
+    for g, n in g_n.items():
+        free_days = D - len(groups[g][1])
+        if n > free_days * P:
+            issues.append(f"Guruh {g}: haftada {n} juftlik berilgan, lekin dars kunlari bo'yicha faqat "
+                          f"{free_days * P} ta o'rin bor.")
+    caps = sorted(rooms.values())
+    stud = [e["students"] for e in events]
+    for c in sorted(set(stud)):
+        need = sum(1 for s in stud if s >= c)
+        nrooms = sum(1 for cap in caps if cap >= c)
+        if nrooms == 0:
+            issues.append(f"{c} o'rinli xona yo'q: {need} ta dars shuncha o'rin talab qiladi (oqim ma'ruzalari "
+                          f"talabalar sonini qo'shadi).")
+        elif need > nrooms * D * P:
+            issues.append(f"{c} va undan katta sig'imli xonalar yetmaydi: {need} ta juftlik kerak, "
+                          f"xonalar ({nrooms} ta) haftada ko'pi bilan {nrooms * D * P} ta juftlik beradi.")
+    return issues
+
+
 def solve(data, tlimit, w_gap=10, w_tgap=3, w_late=1, w_over=3, w_same=5):
     days, pairs, groups, teachers, rooms, lessons = data
     D, P = len(days), len(pairs)
-    slots = [(d, p) for d in range(D) for p in range(P)]
 
     events = []
     for L in lessons:
@@ -87,37 +131,40 @@ def solve(data, tlimit, w_gap=10, w_tgap=3, w_late=1, w_over=3, w_same=5):
             events.append(dict(L, k=k, eid=len(events),
                                students=sum(groups[g][0] for g in L["groups"])))
 
+    problems = diagnose(data, events)
+    if problems:
+        raise SystemExit("Ma'lumotda muammo bor:\n- " + "\n- ".join(problems))
+
     m = cp_model.CpModel()
-    z = {}
-    ev_vars = defaultdict(list)
+    x = {}  # (eid, d, p) -> BoolVar
+    ev_slots = {}
     for e in events:
-        tbusy = teachers[e["teacher"]][0]
-        for r, cap in rooms.items():
-            if cap < e["students"]:
-                continue
-            for (d, p) in slots:
-                if (d, p) in tbusy or any(d in groups[g][1] for g in e["groups"]):
-                    continue
-                v = m.NewBoolVar(f"z{e['eid']}_{r}_{d}_{p}")
-                z[e["eid"], r, d, p] = v
-                ev_vars[e["eid"]].append(v)
-        if not ev_vars[e["eid"]]:
-            raise SystemExit(f"Dars №{e['id']} ({e['subject']}) uchun mos xona/vaqt yo'q "
-                             f"(talabalar: {e['students']}). Sig'im yoki band vaqtlarni tekshiring.")
-        m.AddExactlyOne(ev_vars[e["eid"]])
+        tb = teachers[e["teacher"]][0]
+        al = [(d, p) for d in range(D) for p in range(P)
+              if (d, p) not in tb and all(d not in groups[g][1] for g in e["groups"])]
+        ev_slots[e["eid"]] = al
+        vs = []
+        for (d, p) in al:
+            v = m.NewBoolVar(f"x{e['eid']}_{d}_{p}")
+            x[e["eid"], d, p] = v
+            vs.append(v)
+        m.AddExactlyOne(vs)
 
-    slot_expr = {(e["eid"], s): [] for e in events for s in slots}
-    for (eid, r, d, p), v in z.items():
-        slot_expr[eid, (d, p)].append(v)
+    # Xonalar: vaqt bo'yicha sig'im sinflari (xonani keyin aniq tayinlaymiz).
+    # Har bir juftlikda, har bir talab darajasi (>= c o'rin) uchun: shunday darslar soni <= shunday xonalar soni.
+    stud = {e["eid"]: e["students"] for e in events}
+    caps = sorted(rooms.values())
+    thresholds = sorted(set(stud.values()))
+    slot_events = defaultdict(list)
+    for (eid, d, p) in x:
+        slot_events[d, p].append(eid)
+    for (d, p), eids in slot_events.items():
+        for c in thresholds:
+            need = [x[eid, d, p] for eid in eids if stud[eid] >= c]
+            nrooms = sum(1 for cap in caps if cap >= c)
+            if len(need) > nrooms:
+                m.Add(sum(need) <= nrooms)
 
-    # Xona: bir vaqtda bitta dars
-    for r in rooms:
-        for (d, p) in slots:
-            vs = [v for (eid, rr, dd, pp), v in z.items() if rr == r and dd == d and pp == p]
-            if len(vs) > 1:
-                m.AddAtMostOne(vs)
-
-    # O'qituvchi va guruh to'qnashuvi
     by_teacher = defaultdict(list)
     by_group = defaultdict(list)
     for e in events:
@@ -126,13 +173,16 @@ def solve(data, tlimit, w_gap=10, w_tgap=3, w_late=1, w_over=3, w_same=5):
             by_group[g].append(e["eid"])
 
     def occupancy(eids, name):
-        """har (kun, juftlik) uchun 0/1 o'zgaruvchi: band yoki yo'q."""
         occ = {}
-        for (d, p) in slots:
-            terms = [v for eid in eids for v in slot_expr[eid, (d, p)]]
-            o = m.NewBoolVar(f"o_{name}_{d}_{p}")
-            m.Add(sum(terms) == o)  # AtMostOne ni ham ta'minlaydi (o <= 1)
-            occ[d, p] = o
+        for d in range(D):
+            for p in range(P):
+                terms = [x[eid, d, p] for eid in eids if (eid, d, p) in x]
+                o = m.NewBoolVar(f"o_{name}_{d}_{p}")
+                if terms:
+                    m.Add(sum(terms) == o)  # bir vaqtda ko'pi bilan bitta dars
+                else:
+                    m.Add(o == 0)
+                occ[d, p] = o
         return occ
 
     g_occ = {g: occupancy(eids, f"g{g}") for g, eids in by_group.items()}
@@ -155,7 +205,6 @@ def solve(data, tlimit, w_gap=10, w_tgap=3, w_late=1, w_over=3, w_same=5):
             obj.append(w * gap)
             yield cnt
 
-    # Guruhlar: oynalar, kech juftliklar, kunlik yuklama
     for g, occ in g_occ.items():
         for d, cnt in zip(range(D), gaps(occ, f"G{g}", w_gap)):
             over = m.NewIntVar(0, P, f"over_{g}_{d}")
@@ -164,27 +213,24 @@ def solve(data, tlimit, w_gap=10, w_tgap=3, w_late=1, w_over=3, w_same=5):
         for (d, p), o in occ.items():
             obj.append(w_late * p * o)
 
-    # O'qituvchilar: oynalar va kunlik maksimum
     for t, occ in t_occ.items():
         for d, cnt in zip(range(D), gaps(occ, f"T{t}", w_tgap)):
             m.Add(cnt <= teachers[t][1])
 
-    # Bir fanning bir turi bir kunga yig'ilib qolmasin; tartib (simmetriya)ni buzish
     by_lesson = defaultdict(list)
     for e in events:
         by_lesson[e["id"]].append(e["eid"])
-    idx = {}
-    for e in events:
-        idx[e["eid"]] = sum((d * P + p) * v for (eid, r, d, p), v in z.items() if eid == e["eid"])
     for lid, eids in by_lesson.items():
+        if len(eids) < 2:
+            continue
+        idx = {eid: sum((d * P + p) * x[eid, d, p] for (d, p) in ev_slots[eid]) for eid in eids}
         for a, b in zip(eids, eids[1:]):
             m.Add(idx[a] + 1 <= idx[b])
-        if len(eids) > 1:
-            for d in range(D):
-                c = sum(v for (eid, r, dd, p), v in z.items() if eid in eids and dd == d)
-                ex = m.NewIntVar(0, len(eids), f"ex_{lid}_{d}")
-                m.Add(ex >= c - 1)
-                obj.append(w_same * ex)
+        for d in range(D):
+            c = sum(x[eid, d, p] for eid in eids for p in range(P) if (eid, d, p) in x)
+            ex = m.NewIntVar(0, len(eids), f"ex_{lid}_{d}")
+            m.Add(ex >= c - 1)
+            obj.append(w_same * ex)
 
     m.Minimize(sum(obj))
     s = cp_model.CpSolver()
@@ -196,11 +242,25 @@ def solve(data, tlimit, w_gap=10, w_tgap=3, w_late=1, w_over=3, w_same=5):
           f"{s.ObjectiveValue() if st in (cp_model.OPTIMAL, cp_model.FEASIBLE) else '-'}  "
           f"| vaqt: {s.WallTime():.1f}s | darslar (event): {len(events)}")
     if st not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise SystemExit("Jadval topilmadi: cheklovlar juda qattiq (xonalar, o'qituvchi yuklamasi yoki band vaqtlar).")
-    res = {}
-    for (eid, r, d, p), v in z.items():
+        raise SystemExit("Jadval topilmadi: cheklovlar juda qattiq (o'qituvchi yuklamasi, band vaqtlar yoki "
+                         "xonalar). Qidiruv vaqtini oshirib ko'ring yoki cheklovlarni yumshating.")
+
+    # Xonalarni tayinlash: har bir juftlikda eng katta talabdan boshlab, eng kichik mos xonani beramiz.
+    per_slot = defaultdict(list)
+    for (eid, d, p), v in x.items():
         if s.Value(v):
-            res[eid] = (d, p, r)
+            per_slot[d, p].append(eid)
+    res = {}
+    for (d, p), eids in per_slot.items():
+        free = sorted(rooms.items(), key=lambda kv: (kv[1], kv[0]))
+        for eid in sorted(eids, key=lambda i: -stud[i]):
+            for j, (r, cap) in enumerate(free):
+                if cap >= stud[eid]:
+                    res[eid] = (d, p, r)
+                    free.pop(j)
+                    break
+            else:
+                raise SystemExit("Ichki xato: xona tayinlanmadi.")
     return events, res, name
 
 
@@ -298,7 +358,7 @@ def write(data, events, res, path, status):
     ws.column_dimensions["B"].width = 8
     ws.column_dimensions["C"].width = 13
     for j in range(len(gnames)):
-        ws.column_dimensions[chr(68 + j)].width = 30
+        ws.column_dimensions[get_column_letter(4 + j)].width = 30
     ws.freeze_panes = "D2"
 
     # O'qituvchilar jadvali
@@ -332,7 +392,7 @@ def write(data, events, res, path, status):
     for col, w in zip("ABC", [12, 8, 13]):
         wt.column_dimensions[col].width = w
     for j in range(len(tn)):
-        wt.column_dimensions[chr(68 + j)].width = 30
+        wt.column_dimensions[get_column_letter(4 + j)].width = 30
     wt.freeze_panes = "D2"
 
     # Hisobot
